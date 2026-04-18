@@ -27,7 +27,9 @@ from config import (
     POLL_FUNDING_OFFHOURS,
     POLL_MACRO_ACTIVE,
     POLL_MACRO_OFFHOURS,
+    POLL_1H_CANDLES,
     POLL_4H_CANDLES,
+    POLL_TOP_MOVERS,
     POLL_SYMBOL_REFRESH,
 )
 from store import store
@@ -109,6 +111,24 @@ def _macro_worker():
             log.error(f"Macro worker error: {e}")
 
 
+# ── Worker: 1h candles (all active symbols) ──────────────────────────────
+
+def _candles_1h_worker():
+    """Refresh 1h candles for all active symbols every hour."""
+    log.info("1h candle worker started")
+    while True:
+        time.sleep(POLL_1H_CANDLES)
+        try:
+            active = list(store.get_active_symbols())
+            for sym in active:
+                c1h = rest.fetch_candles_1h(sym)
+                if c1h:
+                    store.set_candles_1h(sym, c1h)
+        except Exception as e:
+            log.error(f"1h candle worker error: {e}")
+        log.debug(f"1h candles refreshed for {len(active)} symbols")
+
+
 # ── Worker: 4h / 1d candles ───────────────────────────────────────────────
 
 def _multitf_worker():
@@ -133,6 +153,21 @@ def _multitf_worker():
             log.error(f"Multi-TF worker error: {e}")
         log.debug(f"Multi-TF: sleeping {POLL_4H_CANDLES//3600}h")
         time.sleep(POLL_4H_CANDLES)
+
+
+# ── Worker: top movers ────────────────────────────────────────────────────
+
+def _top_movers_worker():
+    """Refresh top 5 gainers + 5 losers by 24h price change."""
+    log.info("Top movers worker started")
+    while True:
+        try:
+            movers = rest.fetch_24h_tickers(top_n=5)
+            store.set_top_movers(movers)
+            log.debug(f"Top movers updated: {len(movers)} entries")
+        except Exception as e:
+            log.error(f"Top movers worker error: {e}")
+        time.sleep(POLL_TOP_MOVERS)
 
 
 # ── Worker: symbol refresh ────────────────────────────────────────────────
@@ -200,23 +235,30 @@ def start():
         if oi is not None:
             store.push_oi(sym, oi, now)
 
-    # Step 3 — Multi-TF candles for anchors
+    # Step 3 — Initial top movers snapshot
+    log.info("Fetching initial top movers...")
+    movers = rest.fetch_24h_tickers(top_n=5)
+    store.set_top_movers(movers)
+
+    # Step 4 — Multi-TF candles for anchors
     for sym in ANCHOR_SYMBOLS:
         c4h = rest.fetch_candles_4h(sym)
         c1d = rest.fetch_candles_1d(sym)
         if c4h: store.set_candles_4h(sym, c4h)
         if c1d: store.set_candles_1d(sym, c1d)
 
-    # Step 4 — WebSocket connections
+    # Step 5 — WebSocket connections
     ws.start(qualifying)
     ws.start_restart_monitor()
 
-    # Step 5 — Background workers
+    # Step 6 — Background workers
     workers = [
         ("funding",        _funding_worker),
         ("oi",             _oi_worker),
         ("macro",          _macro_worker),
+        ("candles-1h",     _candles_1h_worker),
         ("multi-tf",       _multitf_worker),
+        ("top-movers",     _top_movers_worker),
         ("symbol-refresh", _symbol_refresh_worker),
         ("diagnostics",    _diag_worker),
     ]
@@ -225,11 +267,11 @@ def start():
         t.start()
         log.info(f"  ✓ Worker started: {name}")
 
-    # Step 6 — Stage 2: classifier engine (after WS is live so candle callback works)
+    # Step 7 — Stage 2: classifier engine (after WS is live so candle callback works)
     classifier_engine.start()
     log.info("  ✓ Classifier engine started")
 
-    # Step 7 — Dashboard
+    # Step 8 — Dashboard
     dashboard.start()
     log.info("  ✓ Dashboard started on :8050")
 

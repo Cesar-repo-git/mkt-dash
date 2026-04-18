@@ -22,11 +22,19 @@ OI snapshot schema:
         'oi_usd':     float,
         'change_pct': float,   # vs previous snapshot, None if first
     }
+
+Top mover schema (stored in _top_movers list):
+    {
+        'symbol':       str,
+        'price_change_pct': float,   # 24h % change
+        'last_price':   float,
+        'volume_usd':   float,       # 24h quote volume
+    }
 """
 
 import threading
 from collections import deque, defaultdict
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from config import CANDLES_1M_MAXLEN, ANCHOR_SYMBOLS
@@ -41,17 +49,22 @@ class MarketStore:
             lambda: deque(maxlen=CANDLES_1M_MAXLEN)
         )
 
-        # Multi-TF candles for anchors and regime: symbol → list of candle dicts
+        # Multi-TF candles: symbol → list of candle dicts
+        self._candles_1h: dict[str, list] = {}
         self._candles_4h: dict[str, list] = {}
         self._candles_1d: dict[str, list] = {}
 
         # Funding rates: symbol → float (latest)
         self._funding: dict[str, float] = {}
 
-        # OI history: symbol → deque (last 24 snapshots)
-        self._oi: dict[str, deque] = defaultdict(lambda: deque(maxlen=24))
+        # OI history: symbol → deque (last 300 snapshots ≈ 25h at 5m poll)
+        self._oi: dict[str, deque] = defaultdict(lambda: deque(maxlen=300))
 
-        # Session VWAP accumulators: symbol → {pv_sum, vol_sum, session_date}
+        # Top movers: list of dicts [{symbol, price_change_pct, last_price, volume_usd}]
+        self._top_movers: list = []
+
+        # Session VWAP accumulators: symbol → {pv_sum, vol_sum, pv2_sum, session_date}
+        # pv2_sum = Σ(typical² × volume) for std dev band calculation
         self._vwap_acc: dict[str, dict] = {}
 
         # Active qualifying symbols
@@ -103,15 +116,46 @@ class MarketStore:
         today = datetime.now(timezone.utc).date()
         acc = self._vwap_acc.get(symbol)
         if acc is None or acc["session_date"] != today:
-            acc = {"pv_sum": 0.0, "vol_sum": 0.0, "session_date": today}
+            acc = {"pv_sum": 0.0, "pv2_sum": 0.0, "vol_sum": 0.0, "session_date": today}
             self._vwap_acc[symbol] = acc
 
         typical = (candle["high"] + candle["low"] + candle["close"]) / 3.0
         vol = candle["volume_usd"]
         acc["pv_sum"]  += typical * vol
+        acc["pv2_sum"] += typical * typical * vol
         acc["vol_sum"] += vol
 
         return acc["pv_sum"] / acc["vol_sum"] if acc["vol_sum"] > 0 else candle["close"]
+
+    def get_vwap_bands(self, symbol: str, multipliers: tuple = (1.0, 2.0)) -> Optional[dict]:
+        """
+        Return VWAP and upper/lower std dev bands for the current session.
+        bands keys: vwap, upper1, lower1, upper2, lower2
+        """
+        with self._lock:
+            acc = self._vwap_acc.get(symbol)
+            if not acc or acc["vol_sum"] == 0:
+                return None
+            vwap = acc["pv_sum"] / acc["vol_sum"]
+            variance = (acc["pv2_sum"] / acc["vol_sum"]) - (vwap ** 2)
+            std = variance ** 0.5 if variance > 0 else 0.0
+            result = {"vwap": vwap}
+            for m in multipliers:
+                label = str(int(m)) if m == int(m) else str(m)
+                result[f"upper{label}"] = vwap + m * std
+                result[f"lower{label}"] = vwap - m * std
+            return result
+
+    # ── 1h candles (all active symbols) ──────────────────────────────────
+
+    def set_candles_1h(self, symbol: str, candles: list):
+        with self._lock:
+            self._candles_1h[symbol] = candles
+            self._last_updated[f"candle_1h_{symbol}"] = datetime.now(timezone.utc)
+
+    def get_candles_1h(self, symbol: str) -> list:
+        with self._lock:
+            return self._candles_1h.get(symbol, [])
 
     # ── Multi-TF candles (anchors / regime) ───────────────────────────────
 
@@ -166,6 +210,42 @@ class MarketStore:
         with self._lock:
             h = self._oi[symbol]
             return h[-1] if h else None
+
+    def get_oi_change_pct(self, symbol: str, minutes: int) -> Optional[float]:
+        """
+        % change in OI over the last `minutes` window.
+        Finds the oldest snapshot within the window and compares to latest.
+        Returns None if insufficient history.
+        """
+        with self._lock:
+            history = list(self._oi[symbol])
+        if len(history) < 2:
+            return None
+        now = history[-1]["time"]
+        cutoff = now - timedelta(minutes=minutes)
+        # Find the snapshot closest to (but not newer than) the cutoff
+        baseline = None
+        for snap in history:
+            if snap["time"] <= cutoff:
+                baseline = snap
+        if baseline is None:
+            return None
+        latest_oi = history[-1]["oi_usd"]
+        base_oi = baseline["oi_usd"]
+        if base_oi == 0:
+            return None
+        return (latest_oi - base_oi) / base_oi * 100
+
+    # ── Top movers ────────────────────────────────────────────────────────
+
+    def set_top_movers(self, movers: list):
+        """Store sorted list of top 24h gainers and losers."""
+        with self._lock:
+            self._top_movers = movers
+
+    def get_top_movers(self) -> list:
+        with self._lock:
+            return list(self._top_movers)
 
     # ── Macro ─────────────────────────────────────────────────────────────
 

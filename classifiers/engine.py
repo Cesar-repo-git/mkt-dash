@@ -4,44 +4,45 @@ Classifier engine.
 Orchestrates regime classification, MO/MR scoring, and entry trigger
 detection across all active symbols.
 
-Two run modes:
-  1. Full scan   — regime + scores + triggers; runs every 5 min (session)
-                   or 15 min (off-hours). Heavy: reads 1m + 4h candles.
-  2. Trigger scan — entry triggers only on the symbol that just closed a candle.
-                   Light: called on every WS candle close via callback.
-
-Results are stored in a thread-safe dict and exposed via get_signals().
-
 Signal dict schema (one per symbol):
     {
-        'symbol':         str,
-        'regime':         'TRENDING' | 'RANGING' | 'UNCLEAR',
-        'regime_conf':    float,
-        'adx':            float,
-        'hurst':          float or None,
+        'symbol':           str,
+        'regime':           'TRENDING' | 'RANGING' | 'UNCLEAR',
+        'regime_conf':      float,
+        'adx':              float,
 
-        'setup':          'MO_LONG' | 'MO_SHORT' | 'MR_LONG' | 'MR_SHORT' | None,
-        'score':          float 0–100,
-        'viable':         bool,
-        'components':     dict,
+        'setup':            'MO_LONG' | 'MO_SHORT' | 'MR_LONG' | 'MR_SHORT' | None,
+        'score':            float 0–100,
+        'viable':           bool,
+        'components':       dict,
 
-        'trigger':        dict or None,   # from signals.py
-        'trigger_label':  str,
-        'trigger_age_s':  int,            # seconds since trigger fired
+        'price':            float,
+        'vwap':             float or None,
+        'vwap_upper1':      float or None,
+        'vwap_lower1':      float or None,
+        'vwap_pct':         float or None,
+        'funding':          float or None,
 
-        'price':          float,
-        'vwap':           float or None,
-        'vwap_pct':       float or None,  # % price vs VWAP
-        'funding':        float or None,
-        'oi_usd':         float or None,
-        'oi_direction':   str,
-        'vol_trend':      str,
+        'oi_usd':           float or None,
+        'oi_direction':     str,
+        'oi_chg_15m':       float or None,   # % OI change over 15 min
+        'oi_chg_1h':        float or None,
+        'oi_chg_4h':        float or None,
+        'oi_chg_1d':        float or None,
 
-        'support':        float or None,
-        'resistance':     float or None,
+        'vol_trend':        str,
+        'vol_ma30':         float or None,
+        'vol_ma60':         float or None,
 
-        'last_full_scan': datetime or None,
-        'last_trigger_scan': datetime or None,
+        'support':          float or None,   # anchors only
+        'resistance':       float or None,   # anchors only
+
+        'prev_day_high':          float or None,
+        'prev_day_low':           float or None,
+        'prev_day_high_dist_pct': float or None,
+        'prev_day_low_dist_pct':  float or None,
+
+        'last_full_scan':   datetime or None,
     }
 """
 
@@ -64,6 +65,8 @@ from classifiers import regime as regime_mod
 from classifiers import mo as mo_mod
 from classifiers import mr as mr_mod
 from classifiers import signals as sig_mod
+from classifiers import signal_ledger as ledger
+from classifiers.indicators import compute_prev_day_levels
 
 log = logging.getLogger(__name__)
 
@@ -74,28 +77,24 @@ _tz = pytz.timezone(SESSION_TZ)
 _results:     dict[str, dict] = {}
 _results_lock = threading.RLock()
 
-# Trigger lifetime: triggers older than this are cleared from display
 TRIGGER_TTL_SECONDS = 300   # 5 minutes
 
 
 # ── Public API ────────────────────────────────────────────────────────────
 
 def get_signals(
-    min_score:    float  = 0.0,
-    viable_only:  bool   = False,
-    setup_filter: Optional[str] = None,   # 'MO_LONG' | 'MO_SHORT' | 'MR_LONG' | 'MR_SHORT'
-    triggered_only: bool = False,
+    min_score:      float  = 0.0,
+    viable_only:    bool   = False,
+    setup_filter:   Optional[str] = None,
+    triggered_only: bool   = False,
 ) -> list[dict]:
-    """
-    Returns a sorted list of signal dicts (highest score first).
-    Anchors (BTC, ETH) always appear at the top regardless of score.
-    """
+    """Returns a sorted list of signal dicts (highest score first)."""
     with _results_lock:
         results = list(_results.values())
 
     now = datetime.now(timezone.utc)
-
     out = []
+
     for r in results:
         if viable_only and not r.get("viable"):
             continue
@@ -106,7 +105,6 @@ def get_signals(
         if triggered_only and not r.get("trigger"):
             continue
 
-        # Expire stale triggers
         r = dict(r)
         trigger = r.get("trigger")
         if trigger:
@@ -121,7 +119,6 @@ def get_signals(
 
         out.append(r)
 
-    # Sort: anchors first, then by score descending
     def sort_key(r):
         is_anchor = 1 if r["symbol"] in ANCHOR_SYMBOLS else 0
         return (-is_anchor, -(r.get("score") or 0))
@@ -133,7 +130,9 @@ def get_signals(
 
 def _classify_symbol(symbol: str) -> Optional[dict]:
     candles_1m = store.get_candles_1m(symbol)
+    candles_1h = store.get_candles_1h(symbol)
     candles_4h = store.get_candles_4h(symbol)
+    candles_1d = store.get_candles_1d(symbol)
     oi_snaps   = store.get_oi(symbol)
     funding    = store.get_funding(symbol)
 
@@ -142,32 +141,30 @@ def _classify_symbol(symbol: str) -> Optional[dict]:
         return None
 
     latest_candle = candles_1m[-1]
-    price  = latest_candle["close"]
-    vwap   = latest_candle.get("vwap")
-    latest_oi = store.get_latest_oi(symbol)
+    price         = latest_candle["close"]
+    latest_oi     = store.get_latest_oi(symbol)
+    vwap_bands    = store.get_vwap_bands(symbol)
 
     # ── Regime ────────────────────────────────────────────────────────
     regime = regime_mod.classify(candles_4h)
 
-    # ── Score: MO ────────────────────────────────────────────────────
+    # ── Score: MO ─────────────────────────────────────────────────────
     mo_result = mo_mod.score(
-        symbol, candles_1m, candles_4h,
-        regime, vwap, price, oi_snaps,
+        symbol, candles_1m, candles_1h, candles_4h,
+        regime, vwap_bands, price, oi_snaps,
     )
 
-    # ── Score: MR ────────────────────────────────────────────────────
+    # ── Score: MR ─────────────────────────────────────────────────────
     mr_long, mr_short = mr_mod.score(
-        symbol, candles_1m, candles_4h, regime, oi_snaps
+        symbol, candles_1m, candles_1h, candles_4h, regime, oi_snaps
     )
 
-    # ── Pick dominant setup based on regime + score ───────────────────
+    # ── Pick dominant setup based on regime ───────────────────────────
     if regime["regime"] == "TRENDING":
         primary = mo_result
     elif regime["regime"] == "RANGING":
-        # Choose Long vs Short based on which has a trigger (or default Long)
         primary = mr_long
     else:
-        # UNCLEAR: surface whichever scores highest overall
         candidates = [mo_result, mr_long, mr_short]
         primary = max(candidates, key=lambda x: x["score"])
 
@@ -178,7 +175,6 @@ def _classify_symbol(symbol: str) -> Optional[dict]:
     breakout = sig_mod.detect_breakout(candles_1m, resistance, support)
     sfp      = sig_mod.detect_sfp(candles_1m, resistance, support)
 
-    # Prefer the trigger that matches the primary setup direction
     trigger = None
     if regime["regime"] == "TRENDING":
         trigger = breakout
@@ -187,36 +183,67 @@ def _classify_symbol(symbol: str) -> Optional[dict]:
     else:
         trigger = breakout or sfp
 
-    # ── Build result ──────────────────────────────────────────────────
+    # ── OI windowed % changes ─────────────────────────────────────────
+    oi_chg_15m = store.get_oi_change_pct(symbol, 15)
+    oi_chg_1h  = store.get_oi_change_pct(symbol, 60)
+    oi_chg_4h  = store.get_oi_change_pct(symbol, 240)
+    oi_chg_1d  = store.get_oi_change_pct(symbol, 1440)
+
+    # ── VWAP fields ───────────────────────────────────────────────────
+    vwap    = vwap_bands.get("vwap")    if vwap_bands else None
+    upper1  = vwap_bands.get("upper1")  if vwap_bands else None
+    lower1  = vwap_bands.get("lower1")  if vwap_bands else None
     vwap_pct = round((price - vwap) / vwap * 100, 3) if (vwap and vwap > 0) else None
 
+    # ── Previous day H/L ─────────────────────────────────────────────
+    prev_day = compute_prev_day_levels(candles_1d, price) if candles_1d else {
+        "prev_day_high": None, "prev_day_low": None,
+        "prev_day_high_dist_pct": None, "prev_day_low_dist_pct": None,
+    }
+
     return {
-        "symbol":          symbol,
-        "regime":          regime["regime"],
-        "regime_conf":     regime["confidence"],
-        "adx":             regime.get("adx"),
-        "hurst":           regime.get("hurst"),
+        "symbol":           symbol,
+        "regime":           regime["regime"],
+        "regime_conf":      regime["confidence"],
+        "adx":              regime.get("adx"),
 
-        "setup":           primary["setup"],
-        "score":           primary["score"],
-        "viable":          primary["viable"],
-        "components":      primary.get("components", {}),
+        "setup":            primary["setup"],
+        "score":            primary["score"],
+        "viable":           primary["viable"],
+        "components":       primary.get("components", {}),
 
-        "trigger":         trigger,
-        "trigger_label":   sig_mod.trigger_label(trigger),
+        "trigger":          trigger,
+        "trigger_label":    sig_mod.trigger_label(trigger),
 
-        "price":           round(price, 4),
-        "vwap":            round(vwap, 4) if vwap else None,
-        "vwap_pct":        vwap_pct,
-        "funding":         funding,
-        "oi_usd":          latest_oi["oi_usd"] if latest_oi else None,
-        "oi_direction":    primary.get("oi_direction", "UNKNOWN"),
-        "vol_trend":       primary.get("vol_trend", "UNKNOWN"),
+        "price":            round(price, 4),
+        "vwap":             round(vwap, 4) if vwap else None,
+        "vwap_upper1":      round(upper1, 4) if upper1 else None,
+        "vwap_lower1":      round(lower1, 4) if lower1 else None,
+        "vwap_pct":         vwap_pct,
+        "funding":          funding,
 
-        "support":         primary.get("support"),
-        "resistance":      primary.get("resistance"),
+        "oi_usd":           latest_oi["oi_usd"] if latest_oi else None,
+        "oi_direction":     primary.get("oi_direction", "UNKNOWN"),
+        "oi_chg_15m":       round(oi_chg_15m, 3) if oi_chg_15m is not None else None,
+        "oi_chg_1h":        round(oi_chg_1h, 3)  if oi_chg_1h  is not None else None,
+        "oi_chg_4h":        round(oi_chg_4h, 3)  if oi_chg_4h  is not None else None,
+        "oi_chg_1d":        round(oi_chg_1d, 3)  if oi_chg_1d  is not None else None,
 
-        # MO detail (always available)
+        "vol_trend":        primary.get("vol_trend", "UNKNOWN"),
+        "vol_ma30":         mo_result.get("vol_ma30"),
+        "vol_ma60":         mo_result.get("vol_ma60"),
+
+        "support":          primary.get("support"),
+        "resistance":       primary.get("resistance"),
+        "support_dist_pct":    primary.get("support_dist_pct"),
+        "resistance_dist_pct": primary.get("resistance_dist_pct"),
+
+        "prev_day_high":          prev_day["prev_day_high"],
+        "prev_day_low":           prev_day["prev_day_low"],
+        "prev_day_high_dist_pct": prev_day["prev_day_high_dist_pct"],
+        "prev_day_low_dist_pct":  prev_day["prev_day_low_dist_pct"],
+
+        # MO detail
         "mo_long_score":   mo_result["score"] if mo_result["setup"] == "MO_LONG" else None,
         "mo_short_score":  mo_result["score"] if mo_result["setup"] == "MO_SHORT" else None,
         "staircase_score": mo_result.get("staircase_score"),
@@ -227,25 +254,21 @@ def _classify_symbol(symbol: str) -> Optional[dict]:
         "mr_short_score":  mr_short["score"],
         "range_pct":       mr_long.get("range_pct"),
         "range_duration":  mr_long.get("range_duration"),
+        "ma_crossings":    mr_long.get("ma_crossings"),
 
-        "last_full_scan":     datetime.now(timezone.utc),
-        "last_trigger_scan":  datetime.now(timezone.utc),
+        "last_full_scan":  datetime.now(timezone.utc),
     }
 
 
 # ── Fast trigger-only scan (called on every candle close) ────────────────
 
 def on_candle(symbol: str, candle: dict):
-    """
-    Registered as WS candle callback. Only re-evaluates entry triggers
-    to avoid running full classification 50+ times per minute.
-    """
     try:
         with _results_lock:
             existing = _results.get(symbol)
 
         if not existing:
-            return   # symbol not yet classified
+            return
 
         candles_1m = store.get_candles_1m(symbol, limit=5)
         support    = existing.get("support")
@@ -270,9 +293,8 @@ def on_candle(symbol: str, candle: dict):
             )
             with _results_lock:
                 if symbol in _results:
-                    _results[symbol]["trigger"]            = trigger
-                    _results[symbol]["trigger_label"]      = sig_mod.trigger_label(trigger)
-                    _results[symbol]["last_trigger_scan"]  = datetime.now(timezone.utc)
+                    _results[symbol]["trigger"]       = trigger
+                    _results[symbol]["trigger_label"] = sig_mod.trigger_label(trigger)
 
     except Exception as e:
         log.error(f"on_candle error for {symbol}: {e}")
@@ -286,11 +308,11 @@ def _in_session() -> bool:
 
 
 def run_full_scan():
-    """Classify all active symbols. Updates _results in place."""
     symbols = list(store.get_active_symbols())
     log.info(f"Full scan: {len(symbols)} symbols")
-    updated = 0
-    errors  = 0
+    updated  = 0
+    viable   = 0
+    errors   = 0
     for sym in symbols:
         try:
             result = _classify_symbol(sym)
@@ -298,15 +320,23 @@ def run_full_scan():
                 with _results_lock:
                     _results[sym] = result
                 updated += 1
+                if result.get("viable"):
+                    ledger.upsert(sym, result)
+                    viable += 1
         except Exception as e:
             log.error(f"Classify {sym}: {e}")
             errors += 1
-    log.info(f"Full scan complete: {updated} classified, {errors} errors")
+
+    expired = ledger.expire()
+    log.info(
+        f"Full scan complete: {updated} classified, {viable} viable, "
+        f"{expired} ledger entries expired, {errors} errors"
+    )
 
 
 def _scan_loop():
-    active_interval   = 5 * 60    # 5 min during session
-    offhours_interval = 15 * 60   # 15 min off-hours
+    active_interval   = 5 * 60
+    offhours_interval = 15 * 60
 
     while True:
         interval = active_interval if _in_session() else offhours_interval
@@ -317,16 +347,16 @@ def _scan_loop():
             log.error(f"Scan loop error: {e}")
 
 
+def get_ledger() -> list[dict]:
+    """Return all active signal ledger entries (for dashboard signals table)."""
+    return ledger.get_all()
+
+
 def start():
-    """
-    1. Run an immediate full scan to populate initial results.
-    2. Register the WS candle callback for fast trigger detection.
-    3. Start the background full-scan loop.
-    """
-    log.info("Engine starting — initial full scan")
+    log.info("Engine starting — loading signal ledger and running initial full scan")
+    ledger.load()
     run_full_scan()
 
-    # Register fast trigger callback with WS manager
     from data import binance_ws
     binance_ws.set_candle_callback(on_candle)
     log.info("Candle callback registered")

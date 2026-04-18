@@ -13,9 +13,10 @@ VOLUME_USD_MIN = 100_000
 # Candle history kept in memory per symbol (500 × 1m ≈ 8 h of data)
 CANDLES_1M_MAXLEN = 500
 
-# How many 4h / 1d candles to fetch for BTC/ETH anchor analysis
-CANDLES_4H_LIMIT = 60   # ~10 days
-CANDLES_1D_LIMIT = 30   # ~1 month
+# How many candles to fetch per timeframe
+CANDLES_1H_LIMIT = 48   # ~2 days of 1h candles (all active symbols)
+CANDLES_4H_LIMIT = 60   # ~10 days (anchors + active)
+CANDLES_1D_LIMIT = 30   # ~1 month (anchors only)
 
 # Symbols always included regardless of volume filter
 ANCHOR_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
@@ -33,7 +34,9 @@ POLL_FUNDING_ACTIVE    =  5 * 60   # funding + OI during session
 POLL_FUNDING_OFFHOURS  = 15 * 60
 POLL_MACRO_ACTIVE      = 15 * 60   # VIX, F&G, ETF during session
 POLL_MACRO_OFFHOURS    = 60 * 60
+POLL_1H_CANDLES        =  1 * 60 * 60   # refresh 1h candles for all active symbols
 POLL_4H_CANDLES        =  4 * 60 * 60
+POLL_TOP_MOVERS        = 15 * 60         # refresh 24h top gainers/losers
 POLL_SYMBOL_REFRESH    = 15 * 60   # re-scan for new qualifying symbols
 
 # ── Session hours (WET = Europe/Lisbon) ───────────────────────────────────

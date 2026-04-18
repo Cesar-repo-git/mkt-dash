@@ -23,6 +23,7 @@ from config import (
     REST_MAX_WEIGHT_MIN,
     VOLUME_USD_MIN,
     ANCHOR_SYMBOLS,
+    CANDLES_1H_LIMIT,
     CANDLES_4H_LIMIT,
     CANDLES_1D_LIMIT,
 )
@@ -126,6 +127,16 @@ def fetch_candles_1m(symbol: str, limit: int = 100) -> list[dict]:
     return _parse_klines(data[:-1], symbol)   # drop the open (current) candle
 
 
+def fetch_candles_1h(symbol: str, limit: int = CANDLES_1H_LIMIT) -> list[dict]:
+    weight = 2 if limit <= 100 else 5
+    data = _get("/fapi/v1/klines",
+                {"symbol": symbol, "interval": "1h", "limit": limit + 1},
+                weight=weight)
+    if not data:
+        return []
+    return _parse_klines(data[:-1], symbol)
+
+
 def fetch_candles_4h(symbol: str, limit: int = CANDLES_4H_LIMIT) -> list[dict]:
     weight = 2 if limit <= 100 else 5
     data = _get("/fapi/v1/klines",
@@ -188,11 +199,41 @@ def _get_mark_price(symbol: str) -> Optional[float]:
     return None
 
 
+# ── 24h tickers (top movers) ─────────────────────────────────────────────
+
+def fetch_24h_tickers(top_n: int = 5) -> list[dict]:
+    """
+    Fetch 24h price change stats for all USDT perpetuals.
+    Returns top_n gainers + top_n losers sorted by |change_pct|.
+    Weight: 40 (bulk ticker endpoint).
+    """
+    data = _get("/fapi/v1/ticker/24hr", weight=40)
+    if not data:
+        return []
+    tickers = []
+    for t in data:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        try:
+            tickers.append({
+                "symbol":           sym,
+                "price_change_pct": float(t["priceChangePercent"]),
+                "last_price":       float(t["lastPrice"]),
+                "volume_usd":       float(t["quoteVolume"]),
+            })
+        except (KeyError, ValueError):
+            continue
+    gainers = sorted(tickers, key=lambda x: x["price_change_pct"], reverse=True)[:top_n]
+    losers  = sorted(tickers, key=lambda x: x["price_change_pct"])[:top_n]
+    return gainers + losers
+
+
 # ── Bulk initialisation helpers ───────────────────────────────────────────
 
 def warmup_symbol(symbol: str) -> bool:
     """
-    Load 1m history + 4h + 1d candles into the store for one symbol.
+    Load 1m + 1h history into store for all symbols; also 4h + 1d for anchors.
     Returns True on success.
     """
     candles_1m = fetch_candles_1m(symbol, limit=100)
@@ -201,6 +242,10 @@ def warmup_symbol(symbol: str) -> bool:
 
     for c in candles_1m:
         store.push_candle_1m(symbol, c)
+
+    c1h = fetch_candles_1h(symbol)
+    if c1h:
+        store.set_candles_1h(symbol, c1h)
 
     if symbol in ANCHOR_SYMBOLS:
         c4h = fetch_candles_4h(symbol)

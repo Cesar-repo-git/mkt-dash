@@ -39,8 +39,6 @@ def compute_adx(candles: list, period: int = 14) -> Optional[float]:
     Average Directional Index via Wilder smoothing. Returns 0–100.
     > 25 → trending; < 20 → ranging.
     Requires at least 2×period + 1 candles.
-
-    Wilder's method: steady-state = input * period, so initial = sum(first period values).
     """
     if len(candles) < period * 2 + 1:
         return None
@@ -63,12 +61,10 @@ def compute_adx(candles: list, period: int = 14) -> Optional[float]:
         pdm_raw[i] = up   if (up > down and up > 0)   else 0.0
         ndm_raw[i] = down if (down > up and down > 0) else 0.0
 
-    # Wilder initial = SUM (not mean) — steady state is val * period
     atr  = float(tr_raw[1:period + 1].sum())
     apdm = float(pdm_raw[1:period + 1].sum())
     andm = float(ndm_raw[1:period + 1].sum())
 
-    # Seed first DX from initial smoothed values
     if atr <= 0:
         return None
     pdi0 = 100 * apdm / atr
@@ -76,7 +72,6 @@ def compute_adx(candles: list, period: int = 14) -> Optional[float]:
     den0 = pdi0 + ndi0
     dx_vals = [100 * abs(pdi0 - ndi0) / den0 if den0 > 0 else 0.0]
 
-    # Roll forward: Wilder update = prev * (p-1)/p + new_raw
     for i in range(period + 1, n):
         atr  = atr  * (period - 1) / period + tr_raw[i]
         apdm = apdm * (period - 1) / period + pdm_raw[i]
@@ -93,62 +88,74 @@ def compute_adx(candles: list, period: int = 14) -> Optional[float]:
     if len(dx_vals) < period:
         return None
 
-    # ADX = Wilder smooth of DX; initial = sum of first `period` DX values
     adx = sum(dx_vals[:period])
     for dx in dx_vals[period:]:
         adx = adx * (period - 1) / period + dx
 
-    # Normalise: ADX steady state = dx * period → divide by period
     return float(adx / period)
 
 
-# ── Hurst Exponent (variance-time method) ────────────────────────────────
+# ── Simple MA ────────────────────────────────────────────────────────────
 
-def compute_hurst(candles: list) -> Optional[float]:
-    """
-    Estimates Hurst exponent via variance-time scaling of log-price changes.
-    Var(log_price[t+τ] - log_price[t]) ~ τ^(2H)
-
-    H > 0.55 → persistent / trending
-    H < 0.45 → anti-persistent / mean-reverting
-    H ≈ 0.50 → random walk
-
-    Uses 4h candle closes; requires ≥ 32 candles.
-    """
-    if len(candles) < 32:
+def compute_ma(candles: list, period: int) -> Optional[float]:
+    """Latest simple moving average of closes."""
+    if len(candles) < period:
         return None
+    closes = _closes(candles)
+    return float(closes[-period:].mean())
 
-    log_prices = np.log(_closes(candles))
 
-    lags     = [2, 4, 8, 16]
-    log_lags = []
-    log_vars = []
-
-    for lag in lags:
-        if lag >= len(log_prices):
-            continue
-        # τ-step log-price change (NOT difference of log-returns)
-        changes = log_prices[lag:] - log_prices[:-lag]
-        var = float(np.var(changes))
-        if var > 0:
-            log_lags.append(math.log(lag))
-            log_vars.append(math.log(var))
-
-    if len(log_lags) < 3:
+def compute_ma_series(candles: list, period: int) -> Optional[np.ndarray]:
+    """Full MA series aligned to candles (NaN for first period-1 values)."""
+    if len(candles) < period:
         return None
+    closes = _closes(candles)
+    result = np.full(len(closes), np.nan)
+    for i in range(period - 1, len(closes)):
+        result[i] = closes[i - period + 1 : i + 1].mean()
+    return result
 
-    # slope of log(Var) vs log(τ) ≈ 2H
-    slope = np.polyfit(log_lags, log_vars, 1)[0]
-    return float(np.clip(slope / 2.0, 0.0, 1.0))
+
+# ── SMMA (Smoothed Moving Average, aka Wilder MA) ─────────────────────────
+
+def compute_smma(candles: list, period: int) -> Optional[float]:
+    """Latest SMMA value. Uses Wilder smoothing: alpha = 1/period."""
+    if len(candles) < period:
+        return None
+    closes = _closes(candles)
+    smma = closes[:period].mean()
+    for price in closes[period:]:
+        smma = (smma * (period - 1) + price) / period
+    return float(smma)
+
+
+def compute_smma_series(candles: list, period: int) -> Optional[np.ndarray]:
+    """Full SMMA series aligned to candles (NaN for first period-1 values)."""
+    if len(candles) < period:
+        return None
+    closes = _closes(candles)
+    result = np.full(len(closes), np.nan)
+    smma = closes[:period].mean()
+    result[period - 1] = smma
+    for i in range(period, len(closes)):
+        smma = (smma * (period - 1) + closes[i]) / period
+        result[i] = smma
+    return result
+
+
+# ── Volume MAs ───────────────────────────────────────────────────────────
+
+def compute_vol_ma(candles: list, period: int) -> Optional[float]:
+    """Latest MA of volume_usd."""
+    if len(candles) < period:
+        return None
+    vols = _volumes(candles)
+    return float(vols[-period:].mean())
 
 
 # ── Swing highs / lows ────────────────────────────────────────────────────
 
 def find_swing_highs(candles: list, lookback: int = 3) -> list[dict]:
-    """
-    Returns list of swing highs: { 'index': int, 'price': float, 'time': datetime }
-    A swing high has the highest 'high' within ±lookback candles.
-    """
     highs = _highs(candles)
     swings = []
     for i in range(lookback, len(candles) - lookback):
@@ -163,9 +170,6 @@ def find_swing_highs(candles: list, lookback: int = 3) -> list[dict]:
 
 
 def find_swing_lows(candles: list, lookback: int = 3) -> list[dict]:
-    """
-    Returns list of swing lows: { 'index': int, 'price': float, 'time': datetime }
-    """
     lows = _lows(candles)
     swings = []
     for i in range(lookback, len(candles) - lookback):
@@ -184,13 +188,7 @@ def find_swing_lows(candles: list, lookback: int = 3) -> list[dict]:
 def compute_sr_levels(candles: list, n_swings: int = 5) -> dict:
     """
     Derives support and resistance from recent swing lows/highs on 4h candles.
-    Returns:
-        {
-            'support':    float or None,   # nearest swing low below current price
-            'resistance': float or None,   # nearest swing high above current price
-            'support_dist_pct':    float,  # distance to support as % of price
-            'resistance_dist_pct': float,
-        }
+    Only used for BTC/ETH anchors.
     """
     if len(candles) < 10:
         return {"support": None, "resistance": None,
@@ -200,11 +198,9 @@ def compute_sr_levels(candles: list, n_swings: int = 5) -> dict:
     swing_highs = find_swing_highs(candles[-50:] if len(candles) > 50 else candles)
     swing_lows  = find_swing_lows(candles[-50:]  if len(candles) > 50 else candles)
 
-    # Nearest resistance above price
     above = [s["price"] for s in swing_highs if s["price"] > current_price]
     resistance = min(above) if above else None
 
-    # Nearest support below price
     below = [s["price"] for s in swing_lows if s["price"] < current_price]
     support = max(below) if below else None
 
@@ -218,6 +214,30 @@ def compute_sr_levels(candles: list, n_swings: int = 5) -> dict:
         "resistance":          resistance,
         "support_dist_pct":    dist_pct(support),
         "resistance_dist_pct": dist_pct(resistance),
+    }
+
+
+# ── Previous day H/L ─────────────────────────────────────────────────────
+
+def compute_prev_day_levels(candles_1d: list, current_price: float) -> dict:
+    """
+    Returns previous day high/low and distance % from current price.
+    Requires ≥ 2 daily candles.
+    """
+    empty = {"prev_day_high": None, "prev_day_low": None,
+             "prev_day_high_dist_pct": None, "prev_day_low_dist_pct": None}
+    if len(candles_1d) < 2:
+        return empty
+    prev = candles_1d[-2]   # last closed daily candle
+
+    def dist(level):
+        return round((current_price - level) / level * 100, 2) if level else None
+
+    return {
+        "prev_day_high":          float(prev["high"]),
+        "prev_day_low":           float(prev["low"]),
+        "prev_day_high_dist_pct": dist(prev["high"]),
+        "prev_day_low_dist_pct":  dist(prev["low"]),
     }
 
 
@@ -258,53 +278,72 @@ def classify_vol_trend(slope: Optional[float]) -> str:
 
 def compute_staircase_score(candles: list, direction: str) -> Optional[float]:
     """
-    Measures how 'clean' a trending staircase is.
-    direction: 'LONG'  → looks for HH + HL pattern
-               'SHORT' → looks for LH + LL pattern
+    Measures how clean a trending staircase is over a ≥60 candle window
+    (minimum 1h of 1m bars, ideally 2h = 120 candles).
 
-    Uses swing-point analysis where possible; falls back to a
-    candle-by-candle consistency score for strong trends with few
-    pullbacks (common in fast-moving crypto markets).
+    Scoring components:
+    - MA(30) discipline: % of candles where close respects MA(30)
+      (above for LONG, below for SHORT) — less touches = better
+    - HH+HL (LONG) or LH+LL (SHORT) swing structure
+    - Candle consistency: % of bars moving in the right direction
 
-    Returns 0–100. Requires ≥ 20 candles.
+    Returns 0–100. Requires ≥ 60 candles.
     """
-    if len(candles) < 20:
+    if len(candles) < 60:
         return None
 
-    recent = candles[-60:] if len(candles) > 60 else candles
+    # Use a 2h window (120 bars) if available, else 1h (60 bars)
+    window = candles[-120:] if len(candles) >= 120 else candles[-60:]
 
-    # ── Fallback: candle consistency score ───────────────────────────
-    # % of candles moving in the right direction + higher/lower closes
-    closes = _closes(recent)
+    closes = _closes(window)
+
+    # ── MA(30) discipline ─────────────────────────────────────────────
+    ma30 = compute_ma_series(window, 30)
+    if ma30 is not None:
+        valid = ~np.isnan(ma30)
+        if valid.sum() > 0:
+            if direction == "LONG":
+                # Respecting MA(30) = close above MA; touches = crosses below
+                respects = np.sum(closes[valid] >= ma30[valid])
+            else:
+                respects = np.sum(closes[valid] <= ma30[valid])
+            ma_score = respects / valid.sum() * 100
+        else:
+            ma_score = 50.0
+    else:
+        ma_score = 50.0
+
+    # ── Candle consistency ────────────────────────────────────────────
     if direction == "LONG":
         consistent = sum(1 for i in range(1, len(closes)) if closes[i] > closes[i - 1])
     else:
         consistent = sum(1 for i in range(1, len(closes)) if closes[i] < closes[i - 1])
     candle_score = consistent / (len(closes) - 1) * 100
 
-    # ── Swing-point score ─────────────────────────────────────────────
-    highs_list = find_swing_highs(recent, lookback=3)
-    lows_list  = find_swing_lows(recent, lookback=3)
+    # ── Swing-point structure ─────────────────────────────────────────
+    highs_list = find_swing_highs(window, lookback=3)
+    lows_list  = find_swing_lows(window, lookback=3)
 
-    if len(highs_list) < 2 or len(lows_list) < 2:
-        # Not enough swing points — return candle consistency only
-        return round(candle_score, 1)
+    swing_score = 0.0
+    if len(highs_list) >= 2 and len(lows_list) >= 2:
+        def pct_higher(points):
+            wins = sum(1 for i in range(1, len(points)) if points[i]["price"] > points[i - 1]["price"])
+            return wins / (len(points) - 1)
 
-    def pct_higher(points):
-        wins = sum(1 for i in range(1, len(points)) if points[i]["price"] > points[i - 1]["price"])
-        return wins / (len(points) - 1)
+        def pct_lower(points):
+            wins = sum(1 for i in range(1, len(points)) if points[i]["price"] < points[i - 1]["price"])
+            return wins / (len(points) - 1)
 
-    def pct_lower(points):
-        wins = sum(1 for i in range(1, len(points)) if points[i]["price"] < points[i - 1]["price"])
-        return wins / (len(points) - 1)
+        if direction == "LONG":
+            swing_score = (pct_higher(highs_list) * 0.5 + pct_higher(lows_list) * 0.5) * 100
+        else:
+            swing_score = (pct_lower(highs_list) * 0.5 + pct_lower(lows_list) * 0.5) * 100
 
-    if direction == "LONG":
-        swing_score = (pct_higher(highs_list) * 0.5 + pct_higher(lows_list) * 0.5) * 100
-    else:
-        swing_score = (pct_lower(highs_list) * 0.5 + pct_lower(lows_list) * 0.5) * 100
+        # Blend all three components
+        return round(ma_score * 0.40 + swing_score * 0.35 + candle_score * 0.25, 1)
 
-    # Blend: swing structure is more meaningful; candle consistency is a safe fallback
-    return round(swing_score * 0.7 + candle_score * 0.3, 1)
+    # No swing points — weight MA discipline and candle consistency
+    return round(ma_score * 0.55 + candle_score * 0.45, 1)
 
 
 # ── Trend duration ────────────────────────────────────────────────────────
@@ -313,7 +352,6 @@ def compute_trend_duration(candles: list, direction: str) -> int:
     """
     Counts how many consecutive closed candles have been moving in the given
     direction (close > open for LONG; close < open for SHORT).
-    Useful as a quality enhancer for MO setups.
     """
     count = 0
     for c in reversed(candles):
@@ -337,7 +375,7 @@ def classify_oi_direction(oi_snapshots: list) -> str:
     if len(oi_snapshots) < 3:
         return "UNKNOWN"
 
-    recent = oi_snapshots[-6:]   # last 6 readings (≈ 30 min on 5min poll)
+    recent = oi_snapshots[-6:]
     changes = [
         s["change_pct"] for s in recent
         if s.get("change_pct") is not None
@@ -361,59 +399,83 @@ def classify_oi_direction(oi_snapshots: list) -> str:
 
 def compute_range_quality(candles: list) -> Optional[dict]:
     """
-    Assesses how well-defined a sideways range is.
+    Assesses how well-defined a sideways range is for MR setups.
+
+    Requirements:
+    - Minimum 60 candles (1h window); uses up to 120 (2h)
+    - Range width ≥ 5% (hard minimum for MR viability)
+    - MA(30) × SMMA(120) crossings: more crossings = choppier = better for MR
+    - % of candles within the range
+
     Returns:
         {
             'score':        float 0–100,
             'range_high':   float,
             'range_low':    float,
-            'range_pct':    float,   # width as % of mid-price
-            'duration':     int,     # candles spent in range
+            'range_pct':    float,
+            'duration':     int,
+            'ma_crossings': int,    # MA(30) × SMMA(120) cross count
         }
-    or None if insufficient data.
+    or None if insufficient data or range too narrow.
     """
-    if len(candles) < 20:
+    if len(candles) < 60:
         return None
 
-    recent = candles[-40:] if len(candles) > 40 else candles
-    closes = _closes(recent)
-    highs  = _highs(recent)
-    lows   = _lows(recent)
+    window = candles[-120:] if len(candles) >= 120 else candles[-60:]
+
+    closes = _closes(window)
+    highs  = _highs(window)
+    lows   = _lows(window)
 
     range_high = float(highs.max())
     range_low  = float(lows.min())
     mid        = (range_high + range_low) / 2.0
     range_pct  = (range_high - range_low) / mid * 100
 
+    # Hard gate: MR requires meaningful range
+    if range_pct < 5.0:
+        return None
+
     mean  = closes.mean()
     std   = closes.std()
-
-    # Pct of candles within 1.5 std of mean → range cleanliness
     within = np.sum(np.abs(closes - mean) <= 1.5 * std) / len(closes) * 100
 
-    # Penalise if range is too narrow (< 0.5%) or too wide (> 15%)
+    # Penalise extremely wide ranges (> 25%)
     width_score = 100.0
-    if range_pct < 0.5:
-        width_score = 20.0
-    elif range_pct > 15.0:
-        width_score = max(0.0, 100.0 - (range_pct - 15.0) * 5)
+    if range_pct > 25.0:
+        width_score = max(0.0, 100.0 - (range_pct - 25.0) * 4)
 
-    score = within * 0.6 + width_score * 0.4
+    # MA(30) × SMMA(120) crossings — more = choppier = better for MR
+    ma30   = compute_ma_series(window, 30)
+    smma120 = compute_smma_series(window, min(120, len(window)))
+    ma_crossings = 0
+    if ma30 is not None and smma120 is not None:
+        valid = ~(np.isnan(ma30) | np.isnan(smma120))
+        diff = ma30[valid] - smma120[valid]
+        if len(diff) > 1:
+            signs = np.sign(diff)
+            ma_crossings = int(np.sum(np.diff(signs) != 0))
 
-    # Duration: how many consecutive candles remained within the range
+    # More crossings → higher chop score (cap at 10 crossings = 100%)
+    chop_score = min(100.0, ma_crossings / 10.0 * 100.0)
+
+    score = within * 0.40 + width_score * 0.25 + chop_score * 0.35
+
+    # Duration: consecutive candles within range
     duration = 0
-    for c in reversed(recent):
+    for c in reversed(window):
         if range_low <= c["close"] <= range_high:
             duration += 1
         else:
             break
 
     return {
-        "score":      round(score, 1),
-        "range_high": range_high,
-        "range_low":  range_low,
-        "range_pct":  round(range_pct, 2),
-        "duration":   duration,
+        "score":        round(score, 1),
+        "range_high":   range_high,
+        "range_low":    range_low,
+        "range_pct":    round(range_pct, 2),
+        "duration":     duration,
+        "ma_crossings": ma_crossings,
     }
 
 
