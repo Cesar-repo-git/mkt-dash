@@ -56,6 +56,8 @@ def set_candle_callback(cb: Callable):
 
 def _on_message(ws, raw):
     try:
+        if not isinstance(raw, str) or not raw.startswith("{"):
+            return
         msg = json.loads(raw)
         data = msg.get("data", msg)
 

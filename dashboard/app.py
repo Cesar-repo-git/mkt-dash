@@ -405,8 +405,8 @@ def _chart_4h(symbol):
             name=symbol,
             increasing_line_color=C["green"],
             decreasing_line_color=C["red"],
-            increasing_fillcolor=C["green"] + "88",
-            decreasing_fillcolor=C["red"] + "88",
+            increasing_fillcolor="rgba(63,185,80,0.35)",
+            decreasing_fillcolor="rgba(248,81,73,0.35)",
         ))
 
     if sig:
