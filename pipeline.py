@@ -35,6 +35,7 @@ from data import binance_rest as rest
 from data import binance_ws   as ws
 from data import macro         as macro_mod
 from classifiers import engine as classifier_engine
+from dashboard import app as dashboard
 
 log = logging.getLogger(__name__)
 _tz = pytz.timezone(SESSION_TZ)
@@ -227,6 +228,10 @@ def start():
     # Step 6 — Stage 2: classifier engine (after WS is live so candle callback works)
     classifier_engine.start()
     log.info("  ✓ Classifier engine started")
+
+    # Step 7 — Dashboard
+    dashboard.start()
+    log.info("  ✓ Dashboard started on :8050")
 
     log.info("=" * 60)
     log.info(f"✅ Pipeline live — {len(qualifying)} symbols tracked")
