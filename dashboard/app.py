@@ -425,7 +425,7 @@ def _chart_4h(symbol):
         plot_bgcolor=C["bg"],
         font=dict(color=C["text"], size=11),
         xaxis=dict(showgrid=False, color=C["dim"], rangeslider_visible=False),
-        yaxis=dict(showgrid=True, gridcolor=C["border"] + "66", color=C["dim"]),
+        yaxis=dict(showgrid=True, gridcolor="rgba(48,54,61,0.4)", color=C["dim"]),
         margin=dict(l=10, r=10, t=30, b=10),
         height=280,
         showlegend=False,
