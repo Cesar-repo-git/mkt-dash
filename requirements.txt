@@ -1,0 +1,6 @@
+requests>=2.31.0
+websocket-client>=1.6.4
+pandas>=2.0.0
+numpy>=1.24.0
+yfinance>=0.2.36
+pytz>=2024.1
